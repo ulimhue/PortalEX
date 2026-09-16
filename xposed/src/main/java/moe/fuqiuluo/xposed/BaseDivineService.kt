@@ -62,11 +62,15 @@ abstract class BaseDivineService {
             return false
         }
 
+        // 与系统侧共用同一把钥匙：系统转发来的指令（start/stop/put_config/...）
+        // 才能通过 RemoteCommandHandler.handleInstruction 的 key 校验（旧实现必失败）
+        RemoteCommandHandler.randomKey = randomKey
+
         syncConfig(locationManager, randomKey)
 
         rely.putBinder("proxy", object: Binder() {
             override fun getInterfaceDescriptor(): String {
-                return "moe.fuqiuluo.portal.service.${from}Helper"
+                return "moe.fuqiuluo.portalex.service.${from}Helper"
             }
 
             override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
@@ -75,7 +79,11 @@ abstract class BaseDivineService {
                     if (FakeLoc.enableDebugLog) {
                         Logger.debug("ProxyBinder($from): $bundle")
                     }
-                    if(!RemoteCommandHandler.handleInstruction(randomKey, bundle)) {
+                    // 这是代理通道（调用者只可能是转发指令的 system_server），与
+                    // sendExtraCommand 那个"任何应用都能打"的入口不是一回事 ⇒ 显式区分来源
+                    if(!RemoteCommandHandler.handleInstruction(
+                            randomKey, bundle, RemoteCommandHandler.Origin.PROXY
+                        )) {
                         Logger.error("Failed to handle instruction in $from")
                     }
                     return true
@@ -99,9 +107,14 @@ abstract class BaseDivineService {
         rely.putString("command_id", "sync_config")
         if(locationManager.sendExtraCommand("portal", randomKey, rely)) {
             FakeLoc.enable = rely.getBoolean("enable", FakeLoc.enable)
-            FakeLoc.latitude = rely.getDouble("latitude", FakeLoc.latitude)
-            FakeLoc.longitude = rely.getDouble("longitude", FakeLoc.longitude)
-            FakeLoc.altitude = rely.getDouble("altitude", FakeLoc.offset_altitude)
+            // 坐标不再直写：走**唯一落点入口**（记录位移历史，供速度推算/静止检测使用）。
+            // 直写会让坐标节点多出一条绕过记录的入边（同一节点两个写者）。
+            RemoteCommandHandler.applySyncedCoordinate(
+                rely.getDouble("latitude", FakeLoc.latitude),
+                rely.getDouble("longitude", FakeLoc.longitude)
+            )
+            // 默认值用 altitude 本体：offset_altitude 是带随机抖动的 getter，每次求值都不同
+            FakeLoc.altitude = rely.getDouble("altitude", FakeLoc.altitude)
             FakeLoc.speed = rely.getDouble("speed", FakeLoc.speed)
             FakeLoc.speedAmplitude = rely.getDouble("speed_amplitude", FakeLoc.speedAmplitude)
             FakeLoc.hasBearings = rely.getBoolean("has_bearings", FakeLoc.hasBearings)
@@ -113,9 +126,11 @@ abstract class BaseDivineService {
             }
             FakeLoc.enableLog = rely.getBoolean("enable_log", FakeLoc.enableLog)
             FakeLoc.enableDebugLog = rely.getBoolean("enable_debug_log", FakeLoc.enableDebugLog)
-            FakeLoc.disableGetCurrentLocation = rely.getBoolean("disable_get_current_location", FakeLoc.disableGetCurrentLocation)
-            FakeLoc.disableRegisterLocationListener = rely.getBoolean("disable_register_location_listener", FakeLoc.disableRegisterLocationListener)
-            FakeLoc.disableFusedLocation = rely.getBoolean("disable_fused_location", FakeLoc.disableFusedLocation)
+            // 融合处置：新键（三态）优先；旧布尔键兜底映射为 拒绝/伪装（旧模块/旧 App 互通）
+            FakeLoc.fusedMode = moe.fuqiuluo.xposed.utils.FusedMode.sanitize(
+                rely.getInt("fused_mode", -1).takeIf { it >= 0 }
+                    ?: if (rely.getBoolean("disable_fused_location", false)) 0 else 2
+            )
             FakeLoc.enableAGPS = rely.getBoolean("enable_agps", FakeLoc.enableAGPS)
             FakeLoc.enableNMEA = rely.getBoolean("enable_nmea", FakeLoc.enableNMEA)
             FakeLoc.hideMock = rely.getBoolean("hide_mock", FakeLoc.hideMock)

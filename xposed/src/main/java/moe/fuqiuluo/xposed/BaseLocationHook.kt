@@ -3,7 +3,7 @@ package moe.fuqiuluo.xposed
 import android.location.Location
 import android.location.LocationManager
 import android.os.Build
-import android.os.Bundle
+import android.os.SystemClock
 import de.robv.android.xposed.XposedHelpers
 import moe.fuqiuluo.xposed.utils.FakeLoc
 import moe.fuqiuluo.xposed.utils.Logger
@@ -12,7 +12,13 @@ import moe.microbios.nmea.NmeaValue
 import kotlin.random.Random
 
 abstract class BaseLocationHook: BaseDivineService() {
-    fun injectLocation(originLocation: Location, realLocation: Boolean = true): Location {
+    /**
+     * @param speedWindowMs 速度平均窗口（毫秒），默认 1s = 真机 GPS 的自然出帧率。
+     *   服务端坐标按点跳变推进，若按“相邻两帧”取瞬时速度，只有恰好包含跳变的帧才有速度，
+     *   其余帧为 0 → 应用侧整段间隔不计步（步频掉到下限）。按窗口平均后任何一帧都代表
+     *   “这段时间走了多少”，与采样相位无关。
+     */
+    fun injectLocation(originLocation: Location, realLocation: Boolean = true, speedWindowMs: Long = 1000L): Location {
         if (realLocation) {
             if (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     originLocation.provider == LocationManager.GPS_PROVIDER && originLocation.isComplete
@@ -29,9 +35,23 @@ abstract class BaseLocationHook: BaseDivineService() {
         if (!FakeLoc.enable)
             return originLocation
 
-        if (originLocation.latitude + originLocation.longitude == FakeLoc.latitude + FakeLoc.longitude) {
-            // Already processed
+        // 「放行」模式（不推荐）：融合定位自己算出来的结果**原样交给应用**，不改写。
+        // 为什么这样实现：所有改写路径（provider 层 / LocationResult 容器 / 融合进程内
+        // chooseBestLocation / BlindHook）最终都汇到这一个函数，所以在这里按来源判一次就够，
+        // 不必在每个 hook 里各写一遍。真位置被融合算出来并交给应用 —— 就是历史上的"被拉回"。
+        if (FakeLoc.allowFusedResult &&
+            originLocation.provider == android.location.LocationManager.FUSED_PROVIDER
+        ) {
             return originLocation
+        }
+
+        // 已注入判定：按字段严格比较（旧实现比较经纬度**之和**——不同坐标和值相同会误命中，
+        // 命中即整体跳过改写，包括 extras 清洗）。默认坐标 (0,0) 不参与判定，避免真实 (0,0) fix 误命中。
+        if (FakeLoc.latitude != 0.0 || FakeLoc.longitude != 0.0) {
+            if (originLocation.latitude == FakeLoc.latitude && originLocation.longitude == FakeLoc.longitude) {
+                // Already processed
+                return originLocation
+            }
         }
 
         if (FakeLoc.disableNetworkLocation && originLocation.provider == LocationManager.NETWORK_PROVIDER) {
@@ -43,77 +63,97 @@ abstract class BaseLocationHook: BaseDivineService() {
         val jitterLat = FakeLoc.jitterLocation()
         location.latitude = jitterLat.first
         location.longitude = jitterLat.second
-        location.altitude = FakeLoc.offset_altitude
+        // 高度：**每帧只采样一次**（offset_altitude 是带抖动的 getter，多次求值会给出不同值，
+        // 同一帧的 altitude / mslAltitude 自相矛盾）
+        val frameAltitude = FakeLoc.offset_altitude
+        location.altitude = frameAltitude
+        // 速度由实际模拟位移推算（FakeLoc.measuredSpeed）：移动中 = 实测速度 ± 抖动，静止 = 0。
+        // 早期实现直接写入配置速度，与注入的位置变化无关（跨帧对比位移与 speed 即可发现矛盾）。
         val speedAmp = Random.nextDouble(-FakeLoc.speedAmplitude, FakeLoc.speedAmplitude)
-        location.speed = (originLocation.speed + speedAmp).toFloat()
+        // 速度：按**交付间隔窗口**取平均（间隔参数在此进入数据链）——
+        // 旧实现直接写瞬时 measuredSpeed（400ms 衰减窗口）：交付间隔由应用决定（可 900ms+）时，
+        // 采样常踩到衰减谷值或跳变之间的空档 → 帧携带 vel=0 → 应用侧整段间隔不计步 → 步频偏低。
+        val (frameSpeed, frameMoving) = FakeLoc.averageSpeedOverWindow(speedWindowMs)
+        location.speed = if (frameMoving) {
+            (frameSpeed + speedAmp).coerceAtLeast(0.0).toFloat()
+        } else {
+            0.0f
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && originLocation.hasSpeedAccuracy()) {
-            location.speedAccuracyMetersPerSecond = (FakeLoc.speed + speedAmp).toFloat()
+            // 速度精度：真实设备量级 0.1~0.5 m/s。原实现借用该字段承载模拟速度
+            // （值恒等于速度，异常且可被检测），改为独立随机小值。
+            location.speedAccuracyMetersPerSecond = Random.nextDouble(0.1, 0.5).toFloat()
+
+        /*
+         * 速度保底：静止定位在真机语义里**没有有效航向**（speed==0 ⇒ hasBearing 无意义），
+         * 应用会因此放弃航向、指针归 0——实测目标应用（步道乐跑）在 MI6 上就是这样
+         * （"停下 1 秒后指南针变 0、角度计不再变化"），而我们的位置数据本身是对的
+         * （停下后 vel=0.0 / bear=295° 稳定）。这里给模拟会话留一个极小的速度，
+         * 让 bearing 保持有效，指针停在最后朝向。
+         */
+        if (FakeLoc.enable && location.speed < FakeLoc.speedFloor) {
+            /*
+             * 加抖动而不是给常数：真机静止时 GPS 报的速度是**噪声**（0.1~0.5 m/s 上下跳），
+             * 常数速度反而是个可被识破的指纹（"站着不动却精确 0.300 m/s"）。
+             * 0.6~1.4 倍随机 ⇒ 0.18~0.42 m/s，量级与真机静止噪声一致。
+             */
+            // 低通 + 慢随机游走（见 FakeLoc.speedFloorSample）：与真机静止噪声的时间相关性一致
+            location.speed = FakeLoc.speedFloorSample().toFloat()
+        }
         }
 
         if (location.altitude == 0.0) {
             location.altitude = 80.0
         }
 
-        location.time = originLocation.time
+        // 时间戳统一：注入帧一律携带「生成本帧的时刻」，与推送链 buildFrame() 同语义。
+        // 旧实现沿用 originLocation.time/elapsedRealtimeNanos（真实 fix 的旧时刻），
+        // 于是同一坐标在「推送帧」与「框架帧」上有两套时间——应用按时间差算速率/去重会自相矛盾。
+        location.time = System.currentTimeMillis()
 
         // final addition of zero is to remove -0 results. while these are technically within the
         // range [0, 360) according to IEEE semantics, this eliminates possible user confusion.
-        var modBearing = FakeLoc.bearing % 360.0 + 0.0
+        // 角度加工（模块层）：平滑趋近权威目标 + 微小扰动——
+        // 自动播放直线段时 bearing 恒定，直接写入会让位置/指南针锁死在前进方向。
+        var modBearing = FakeLoc.processedBearing() % 360.0 + 0.0
         if (modBearing < 0) {
             modBearing += 360.0
         }
         location.bearing = modBearing.toFloat()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            location.bearingAccuracyDegrees = modBearing.toFloat()
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (location.hasBearingAccuracy() && location.bearingAccuracyDegrees == 0.0f) {
-                location.bearingAccuracyDegrees = 1.0f
-            }
+            // 朝向精度：真实设备量级 1~5 度。原实现直接写入角度值（bAcc == bearing），异常。
+            location.bearingAccuracyDegrees = Random.nextDouble(1.0, 5.0).toFloat()
         }
 
-        if (location.speed == 0.0f) {
-            location.speed = 1.2f
-        }
-
-        location.elapsedRealtimeNanos = originLocation.elapsedRealtimeNanos
+        location.elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             location.elapsedRealtimeUncertaintyNanos = originLocation.elapsedRealtimeUncertaintyNanos
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            location.verticalAccuracyMeters = originLocation.verticalAccuracyMeters
+            // 垂直精度：原始位置未提供时（0）补合理随机值，避免恒为 0 的异常值
+            location.verticalAccuracyMeters =
+                if (originLocation.hasVerticalAccuracy() && originLocation.verticalAccuracyMeters > 0f) {
+                    originLocation.verticalAccuracyMeters
+                } else {
+                    Random.nextDouble(5.0, 15.0).toFloat()
+                }
         }
-        originLocation.extras?.let {
-            location.extras = it
-        }
-        if (location.extras == null) {
-            location.extras = Bundle()
-        }
-        location.extras?.putDouble("latlon", location.latitude + location.longitude)
-        location.extras?.putInt("satellites", Random.nextInt(8, 45))
-        location.extras?.putInt("maxCn0", Random.nextInt(30, 50))
-        location.extras?.putInt("meanCn0", Random.nextInt(20, 30))
+        // extras 只透传原始数据，不写任何模块自有键：extras 随 Parcel 到达每个拿到该
+        // Location 的应用，键名再中性也是指纹（真实 Location 的 extras 不会长这样）。
+        // 传感器侧改从标准字段（location.speed / location.bearing）取数，无需私有通路。
+        // extras 只透传原始数据，不写任何模块自有键；但系统自带的卫星字段要改写——
+        // 位置伪造到户外后，真实环境（室内）的 satellites=0 会与位置矛盾。
+        location.extras = FakeLoc.sanitizeGnssExtras(originLocation.extras)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             if (originLocation.hasMslAltitude()) {
-                location.mslAltitudeMeters = FakeLoc.offset_altitude
+                location.mslAltitudeMeters = frameAltitude
             }
-            if (originLocation.hasVerticalAccuracy()) {
-                location.mslAltitudeAccuracyMeters = FakeLoc.offset_altitude.toFloat()
+            if (originLocation.hasMslAltitudeAccuracy()) {
+                // 高度精度：真实设备量级 1~5 米。原实现写入高度值本身（80.0），异常。
+                location.mslAltitudeAccuracyMeters = Random.nextDouble(1.0, 5.0).toFloat()
             }
         }
-        if (FakeLoc.hideMock) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                location.isMock = false
-            }
-        } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                location.isMock = true
-            }
-            location.extras?.putBoolean("portal.enable", true)
-            location.extras?.putBoolean("is_mock", true)
-        }
-
         kotlin.runCatching {
             XposedHelpers.callMethod(location, "makeComplete")
         }.onFailure {
@@ -127,6 +167,17 @@ abstract class BaseLocationHook: BaseDivineService() {
         return location
     }
 
+    /**
+     * NMEA 用的坐标：**与 Location 帧同源的保护性抖动**。
+     *
+     * 为什么不能直接用 `FakeLoc.latitude/longitude`：那是配置点本身，NMEA 会变成
+     * "每一句都精确相同的坐标"——真机 GNSS 的 GGA/RMC 从不会这样，而且它与同一时刻
+     * Location API 给出的（带抖动的）坐标会差 ~0.1~0.3m，两条通道对不上账。
+     * 每句语句取**一次**采样，句内经纬度自然一致。
+     */
+    private fun jitteredCoordinate(): Pair<Double, Double> =
+        FakeLoc.jitterLocation(FakeLoc.latitude, FakeLoc.longitude)
+
     fun injectNMEA(nmeaStr: String): String {
         // 未启用模拟时，直接返回原始字符串
         if (!FakeLoc.enable) return nmeaStr
@@ -138,22 +189,26 @@ abstract class BaseLocationHook: BaseDivineService() {
                     // 无效数据不修改，保留原始字符串
                     if (value.latitude == null || value.longitude == null) return nmeaStr
                     if (value.fixQuality == 0) return nmeaStr
-                    updateLatLon(value, FakeLoc.latitude, FakeLoc.longitude)
+                    val (jLat, jLon) = jitteredCoordinate()
+                    updateLatLon(value, jLat, jLon)
                     value.toNmeaString()
                 }
                 is NmeaValue.GNS -> {
                     if (value.latitude == null || value.longitude == null) return nmeaStr
                     if (value.mode == "N") return nmeaStr
-                    updateLatLon(value, FakeLoc.latitude, FakeLoc.longitude)
+                    val (jLat, jLon) = jitteredCoordinate()
+                    updateLatLon(value, jLat, jLon)
                     value.toNmeaString()
                 }
                 is NmeaValue.RMC -> {
                     if (value.latitude == null || value.longitude == null) return nmeaStr
                     if (value.status == "V") return nmeaStr
-                    updateLatLon(value, FakeLoc.latitude, FakeLoc.longitude)
+                    val (jLat, jLon) = jitteredCoordinate()
+                    updateLatLon(value, jLat, jLon)
                     // 同步速度和航向（m/s → 节，1 m/s = 1.94384 knots）
-                    value.speedKnots = FakeLoc.speed * 1.94384
-                    value.trackAngle = FakeLoc.bearing
+                    // 与注入帧统一口径：窗口平均（旧实现用瞬时 measuredSpeed，两条链对不上账）
+                    value.speedKnots = FakeLoc.averageSpeedOverWindow(1000L).first * 1.94384
+                    value.trackAngle = FakeLoc.processedBearing()
                     value.toNmeaString()
                 }
                 // 其他语句类型（DTM、GSA、GSV、VTG）不做修改，原样返回
@@ -165,17 +220,21 @@ abstract class BaseLocationHook: BaseDivineService() {
     }
 
     // 辅助函数：更新GGA/GNS/RMC中的经纬度及半球
+    // NMEA 坐标字段是度分格式（ddmm.mmmm）：十进制度 31.2304° → 度=31，分=0.2304*60=13.824 → 3113.824
+    // （NmeaValue/解析侧将原始度分串直接 toDouble，故此处也必须输出度分数值，与 toNmeaString 的 %011.6f 配套）
     private fun updateLatLon(value: Any, lat: Double, lon: Double) {
         val latHemisphere = if (lat >= 0) "N" else "S"
         val lonHemisphere = if (lon >= 0) "E" else "W"
 
-        val latDeg = lat.toInt()
-        val latMin = (lat - latDeg) * 60
-        val newLat = latDeg + latMin / 100.0
+        val absLat = kotlin.math.abs(lat)
+        val latDeg = absLat.toInt()
+        val latMin = (absLat - latDeg) * 60
+        val newLat = latDeg * 100.0 + latMin
 
-        val lonDeg = lon.toInt()
-        val lonMin = (lon - lonDeg) * 60
-        val newLon = lonDeg + lonMin / 100.0
+        val absLon = kotlin.math.abs(lon)
+        val lonDeg = absLon.toInt()
+        val lonMin = (absLon - lonDeg) * 60
+        val newLon = lonDeg * 100.0 + lonMin
 
         when (value) {
             is NmeaValue.GGA -> {

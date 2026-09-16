@@ -5,7 +5,6 @@ import android.location.LocationManager
 import android.os.Build
 import android.telephony.CellIdentity
 import android.telephony.CellInfo
-import android.util.ArrayMap
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -20,8 +19,23 @@ import moe.fuqiuluo.xposed.utils.onceHook
 import moe.fuqiuluo.xposed.utils.onceHookAllMethod
 import moe.fuqiuluo.xposed.utils.onceHookMethodBefore
 import java.util.Collections
+import kotlin.random.Random
 
 object LocationProviderManagerHook {
+    /**
+     * 逐条注入：**保留批次长度、顺序与空批次**。
+     *
+     * 融合/provider 路径只做「拦截-修改-转发」，**不凭空生成**：
+     * 空 LocationResult 是合法语义（这次没有位置），旧实现在这里补一帧 `Location("gps")`——
+     * 那是造了一次并不存在的定位，既违背口径，也可能被上层当成真实 fix。
+     * 非 Location 元素原样保留（不改长度）。
+     */
+    private fun injectAll(locations: List<*>): ArrayList<Any?> {
+        val injected = ArrayList<Any?>(locations.size)
+        locations.forEach { item -> injected.add(if (item is Location) injectLocation(item) else item) }
+        return injected
+    }
+
     private val hookOnFetchLocationResult = beforeHook {
         if (args.isEmpty()) return@beforeHook
         if (!FakeLoc.enable) return@beforeHook
@@ -39,51 +53,17 @@ object LocationProviderManagerHook {
         mLocationsField.isAccessible = true
         val mLocations = mLocationsField.get(locationResult) as ArrayList<*>
 
-        val originLocation = mLocations.firstOrNull() as? Location
-            ?: Location(LocationManager.GPS_PROVIDER)
-        val location = Location(originLocation.provider)
-
-        val jitterLat = FakeLoc.jitterLocation()
-        location.latitude = jitterLat.first
-        location.longitude = jitterLat.second
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            location.isMock = false
-        }
-        location.altitude = FakeLoc.offset_altitude
-        location.speed = originLocation.speed
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            location.speedAccuracyMetersPerSecond = 0F
-        }
-
-        location.time = originLocation.time
-        location.accuracy = originLocation.accuracy
-        var modBearing = FakeLoc.bearing % 360.0 + 0.0
-        if (modBearing < 0) {
-            modBearing += 360.0
-        }
-        location.bearing = modBearing.toFloat()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && originLocation.hasBearingAccuracy()) {
-            location.bearingAccuracyDegrees = modBearing.toFloat()
-        }
-        location.elapsedRealtimeNanos = originLocation.elapsedRealtimeNanos
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            location.elapsedRealtimeUncertaintyNanos = originLocation.elapsedRealtimeUncertaintyNanos
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            location.verticalAccuracyMeters = originLocation.verticalAccuracyMeters
-        }
-        originLocation.extras?.let {
-            location.extras = it
-        }
-
-        mLocationsField.set(locationResult, arrayListOf(location))
+        // 统一走主注入路径（BaseLocationHook.injectLocation）：
+        // 一个注入实现、一套字段口径——否则同一 tick 里「一次性取位」与
+        // 「持续注册」拿到的帧会在 bearing（平滑/原始）与 accuracy（配置值/原始帧）上分岔。
+        // **逐条注入并保留批次长度**：旧实现替换为单元素，批量位置除首帧外全部丢失。
+        mLocationsField.set(locationResult, injectAll(mLocations))
     }
 
     operator fun invoke(classLoader: ClassLoader) {
         hookLocationProviderManager(classLoader)
         hookDelegateLocationProvider(classLoader)
         hookPassiveLocationProvider(classLoader)
-        hookProxyLocationProvider(classLoader)
         hookAbstractLocationProvider(classLoader)
         hookOtherProvider(classLoader)
         hookGeofenceProvider(classLoader)
@@ -118,13 +98,6 @@ object LocationProviderManagerHook {
                 }
             })
         }
-
-    }
-
-    private fun hookProxyLocationProvider(classLoader: ClassLoader) {
-        val cProxyLocationProvider = XposedHelpers.findClassIfExists("com.android.server.location.provider.proxy.ProxyLocationProvider", classLoader)
-            ?: return
-
 
     }
 
@@ -203,17 +176,20 @@ object LocationProviderManagerHook {
             val hookedListeners = Collections.synchronizedSet(HashSet<String>())
             if(cLocationProviderManager.onceHookAllMethod("getCurrentLocation", object: XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (param.args.size < 4 || param.args[3] == null) return
+                    // 回调不写死索引：新签名 (provider, request, ILocationCallback, packageName, …)
+                    // 的 args[3] 是包名字符串，旧签名 (request, ILocationCallback, packageName) 是 args[2]。
+                    val callback = param.args.firstOrNull { arg ->
+                        arg != null && arg.javaClass.methods.any { it.name == "onLocation" }
+                    } ?: return
 
-                    val callback = param.args[3]
                     if (FakeLoc.enableDebugLog) {
                         Logger.debug("getCurrentLocation injected: $callback")
                     }
 
-                    if(FakeLoc.disableGetCurrentLocation) {
-                        param.result = null
-                        return
-                    }
+                    // 允许并注入：不再 param.result = null。未开模拟透传真实位置；
+                    // 模拟会话中回调上改写为模拟位置（与 LocationServiceHook 同语义；
+                    // 该层不重复登记一次性投递表，避免同一回调被投两次）。
+                    if (!FakeLoc.enable) return
 
                     val classCallback = callback.javaClass
                     if (hookedListeners.contains(classCallback.name)) return // Prevent repeated hooking
@@ -237,81 +213,30 @@ object LocationProviderManagerHook {
             }
         }
 
+        // 注意：此 hook 通过 findMethodExactIfExists("onReportLocation") 无参查找，
+        // AOSP 的 onReportLocation(LocationResult) 是有参私有方法，因此该回调实际不会触发。
+        // 历史版本曾在这里把 mRegistrations 替换为空 ArrayMap（清空所有注册），
+        // 一旦某 ROM 存在无参重载就会直接破坏位置上报——现已移除该危险替换，
+        // 保留只读的日志与注入逻辑作为兜底（若某 ROM 真的触发，也只会注入而不会清空）。
         cLocationProviderManager.onceHookMethodBefore("onReportLocation") {
-            val fieldMRegistrations = XposedHelpers.findFieldIfExists(cLocationProviderManager, "mRegistrations")
-            if (fieldMRegistrations == null) {
-                Logger.error("Failed to find mRegistrations in LocationProviderManager")
-                return@onceHookMethodBefore
-            }
-            if (!fieldMRegistrations.isAccessible)
-                fieldMRegistrations.isAccessible = true
-
             if (!FakeLoc.enable) {
                 return@onceHookMethodBefore
             }
 
-            val registrations = fieldMRegistrations.get(thisObject) as ArrayMap<*, *>
-            val newRegistrations = ArrayMap<Any, Any>()
-            registrations.forEach { registration ->
-                val value = registration.value ?: return@forEach
-                val locationResult = args[0]
+            val locationResult = args[0] ?: return@onceHookMethodBefore
 
-                val mLocationsField = XposedHelpers.findFieldIfExists(locationResult.javaClass, "mLocations")
-                if (mLocationsField == null) {
-                    Logger.error("Failed to find mLocations in LocationResult")
-                    return@onceHookMethodBefore
-                }
-                mLocationsField.isAccessible = true
-                val mLocations = mLocationsField.get(locationResult) as ArrayList<*>
+            val mLocationsField = XposedHelpers.findFieldIfExists(locationResult.javaClass, "mLocations")
+                ?: return@onceHookMethodBefore
+            mLocationsField.isAccessible = true
+            val mLocations = mLocationsField.get(locationResult) as? ArrayList<*>
+                ?: return@onceHookMethodBefore
 
-                val originLocation = mLocations.firstOrNull() as? Location
-                    ?: Location(LocationManager.GPS_PROVIDER)
-                val location = Location(originLocation.provider)
-
-                val jitterLat = FakeLoc.jitterLocation()
-                location.latitude = jitterLat.first
-                location.longitude = jitterLat.second
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    location.isMock = false
-                }
-                location.altitude = FakeLoc.offset_altitude
-                location.speed = originLocation.speed
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    location.speedAccuracyMetersPerSecond = 0F
-                }
-
-                location.time = originLocation.time
-                location.accuracy = originLocation.accuracy
-                var modBearing = FakeLoc.bearing % 360.0 + 0.0
-                if (modBearing < 0) {
-                    modBearing += 360.0
-                }
-                location.bearing = modBearing.toFloat()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && originLocation.hasBearingAccuracy()) {
-                    location.bearingAccuracyDegrees = modBearing.toFloat()
-                }
-                location.elapsedRealtimeNanos = originLocation.elapsedRealtimeNanos
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    location.elapsedRealtimeUncertaintyNanos = originLocation.elapsedRealtimeUncertaintyNanos
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    location.verticalAccuracyMeters = originLocation.verticalAccuracyMeters
-                }
-                originLocation.extras?.let {
-                    location.extras = it
-                }
-
-                mLocationsField.set(locationResult, arrayListOf(location))
-
-                val operation = XposedHelpers.callMethod(value, "acceptLocationChange", locationResult)
-                XposedHelpers.callMethod(value, "executeOperation", operation)
-            }
+            // 同 hookOnFetchLocationResult：统一走主注入路径 + 保留批次长度
+            mLocationsField.set(locationResult, injectAll(mLocations))
 
             if (FakeLoc.enableDebugLog) {
                 Logger.debug("onReportLocation: injected!")
             }
-
-            fieldMRegistrations.set(thisObject, newRegistrations)
         }
     }
 

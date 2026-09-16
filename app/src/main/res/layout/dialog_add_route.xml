@@ -1,32 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
-<com.google.android.material.card.MaterialCardView
+<LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    app:cardCornerRadius="10dp"
-    app:cardBackgroundColor="@color/white">
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="16dp">
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/add_route"
-            android:textSize="18sp"
-            android:textStyle="bold"/>
+            android:textAppearance="?attr/textAppearanceHeadlineSmall"
+            android:textColor="?attr/colorOnSurface"
+            android:padding="12dp"/>
 
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            app:boxBackgroundMode="filled"
-            app:boxBackgroundColor="@color/white"
-            android:hint="@string/name">
+            app:boxBackgroundMode="none"
+            app:hintEnabled="false"
+            >
 
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/etRouteName"
@@ -35,8 +30,10 @@
                 android:imeOptions="actionNext"
                 android:inputType="text"
                 android:singleLine="true"
-                android:textColor="@color/portal_text_color"
-                android:textAppearance="@style/TextAppearance.MaterialComponents.Body2">
+                android:textColor="?attr/colorOnSurface"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:hint="@string/name"
+                android:background="@drawable/edit_text_box">
 
                 <!--<requestFocus />-->
             </com.google.android.material.textfield.TextInputEditText>
@@ -46,9 +43,9 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            app:boxBackgroundMode="filled"
-            app:boxBackgroundColor="@color/white"
-            android:hint="@string/route_set">
+            app:boxBackgroundMode="none"
+            app:hintEnabled="false"
+            >
 
             <com.google.android.material.textfield.TextInputEditText
                 android:id="@+id/etRouteSet"
@@ -57,10 +54,33 @@
                 android:imeOptions="actionNext"
                 android:inputType="text"
                 android:singleLine="true"
-                android:textColor="@color/portal_text_color"
-                android:textAppearance="@style/TextAppearance.MaterialComponents.Body2">
+                android:textColor="?attr/colorOnSurface"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:hint="@string/route_set"
+                android:background="@drawable/edit_text_box">
             </com.google.android.material.textfield.TextInputEditText>
         </com.google.android.material.textfield.TextInputLayout>
 
-    </LinearLayout>
-</com.google.android.material.card.MaterialCardView>
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            app:boxBackgroundMode="none"
+            app:hintEnabled="false"
+            >
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/etRouteSmooth"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:imeOptions="actionDone"
+                android:inputType="text"
+                android:singleLine="true"
+                android:textColor="?attr/colorOnSurface"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:hint="@string/route_smooth_set"
+                android:background="@drawable/edit_text_box">
+            </com.google.android.material.textfield.TextInputEditText>
+        </com.google.android.material.textfield.TextInputLayout>
+
+</LinearLayout>

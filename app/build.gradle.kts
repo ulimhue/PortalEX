@@ -1,18 +1,26 @@
 import com.android.build.api.dsl.ApplicationExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.io.ByteArrayOutputStream
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
-    namespace = "moe.fuqiuluo.portal"
-    compileSdk = 35
+    namespace = "moe.fuqiuluo.portalex"
+    compileSdk = 36
+
+    // app/libs 下的预编译 .so（百度地图/定位、libtiny_magic）由 AGP 的
+    // strip<Variant>DebugSymbols 处理。不声明时 :app 会回退到 AGP 内置默认
+    // NDK 版本（9.3.0 为 28.2.13676358），若本机/CI 未安装该版本，app 的
+    // ndkPlatform 就处于未配置状态：strip 工具找不到，只打印一句
+    // "missing strip tool for ABI ... Packaging it as is." 便退化为原样拷贝，
+    // 这些 .so 会带着原始符号表与构建方绝对路径进包。
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
-        applicationId = "moe.fuqiuluo.portal"
+        applicationId = "moe.fuqiuluo.portalex"
         minSdk = 26
         targetSdk = 35
         versionCode = getVersionCode()
@@ -30,47 +38,24 @@ android {
 //            throw GradleException("在 CI 环境中必须提供 google-services.json 文件!")
 //        }
 
-        manifestPlaceholders["BUGLY_APPID"] = "222f9ef298"
-
-        val publicIp = try {
-            val isWindows = org.gradle.internal.os.OperatingSystem.current().isWindows
-            val process = if (isWindows) {
-                Runtime.getRuntime().exec(arrayOf(
-                    "powershell.exe",
-                    "-command",
-                    "(Invoke-WebRequest -Uri 'https://api.ipify.org' -UseBasicParsing).Content," +
-                            "(Invoke-WebRequest -Uri 'https://ifconfig.me' -UseBasicParsing).Content," +
-                            "(Invoke-WebRequest -Uri 'https://icanhazip.com' -UseBasicParsing).Content," +
-                            "(Invoke-WebRequest -Uri 'https://checkip.amazonaws.com' -UseBasicParsing).Content" +
-                            " | Select-Object -First 1"
-                ))
-            } else {
-                Runtime.getRuntime().exec(arrayOf("sh", "-c",
-                    "curl -s https://api.ipify.org || " +
-                            "curl -s https://ifconfig.me || " +
-                            "curl -s https://icanhazip.com || " +
-                            "curl -s https://checkip.amazonaws.com"
-                ))
+        // 百度地图/定位/检索 SDK 的 AK。百度按「应用包名 + 签名 SHA1」双重校验，
+        // 换包名（portal → portalex）或换签名后旧 AK 必然失效。
+        //
+        // 严禁把真实 AK 写进版本库（含本文件与 AndroidManifest.xml）——它虽随 APK
+        // 一起分发，但登记进仓库会让「谁在什么时候换了哪把 AK」变成公开信息，
+        // 且会随 fork 扩散。取值优先级：
+        //   1. 环境变量 BAIDU_MAP_AK（CI 用 secrets 注入）
+        //   2. Gradle 属性 -PBAIDU_MAP_AK=...
+        //   3. local.properties（该文件已被 .gitignore 排除）
+        //   4. 占位符：构建仍能成功，但检索/逆地理会因 AK 校验失败而不可用
+        val baiduMapAk = System.getenv("BAIDU_MAP_AK")
+            ?: (project.findProperty("BAIDU_MAP_AK") as String?)
+            ?: rootProject.file("local.properties").takeIf { it.exists() }?.let { f ->
+                Properties().apply { f.inputStream().use { load(it) } }
+                    .getProperty("BAIDU_MAP_AK")
             }
-            val reader = process.inputStream.bufferedReader()
-            val ip = reader.readLine()?.trim() ?: "unknown"
-            if (ip.matches("\\d+\\.\\d+\\.\\d+\\.\\d+".toRegex())) ip else "unknown"
-        } catch (e: Exception) {
-            println("Error getting public IP address: ${e.message}")
-            "unknown"
-        }
-
-        val deviceName = try {
-            val process = Runtime.getRuntime().exec("hostname")
-            val reader = process.inputStream.bufferedReader()
-            reader.readLine()?.trim() ?: "unknown"
-        } catch (e: Exception) {
-            println("Error getting device name: ${e.message}")
-            "unknown"
-        }
-        val buildPath = project.rootDir.absolutePath.replace("\\", "/")
-        manifestPlaceholders["BUGLY_BUILD_ENV"] = "IP:$publicIp,DEVICE:$deviceName,PATH:$buildPath"
-        manifestPlaceholders["APP_CHANNEL"] = "$publicIp-$deviceName"
+        manifestPlaceholders["BAIDU_MAP_AK"] = baiduMapAk?.takeIf { it.isNotBlank() }
+            ?: "REPLACE_WITH_YOUR_BAIDU_MAP_AK"
     }
 
     buildTypes {
@@ -80,26 +65,25 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            manifestPlaceholders["APP_VERSION"] = defaultConfig.versionName ?: "UnknownVersion"
-            manifestPlaceholders["BUGLY_ENABLE_DEBUG"] = "false"
         }
 
         debug {
-            manifestPlaceholders["APP_VERSION"] = "${defaultConfig.versionName}-debug"
-            manifestPlaceholders["BUGLY_ENABLE_DEBUG"] = "true"
         }
     }
 
-    android.applicationVariants.all {
-        outputs.map { it as com.android.build.gradle.internal.api.BaseVariantOutputImpl }
-            .forEach {
-                val abiName = when (val abi = it.outputFileName.split("-")[1].split(".apk")[0]) {
-                    "app" -> "all"
-                    "x64" -> "x86_64"
-                    else -> abi
-                }
-                it.outputFileName = "Portal-v${versionName}-${abiName}.apk"
+    // AGP 9：通过 androidComponents 注册输出命名（applicationVariants/BaseVariantOutputImpl 内部 API 已移除）
+    val buildVersionName = defaultConfig.versionName ?: "unknown"
+    androidComponents {
+        onVariants(selector().all()) { variant ->
+            val abiName = when (variant.flavorName) {
+                "app" -> "all"
+                "x64" -> "x86_64"
+                else -> variant.flavorName
             }
+            variant.outputs.forEach { output ->
+                output.outputFileName.set("Portal-v${buildVersionName}-${abiName}.apk")
+            }
+        }
     }
 
     flavorDimensions.add("mode")
@@ -133,12 +117,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
     buildFeatures {
         viewBinding = true
     }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -180,6 +162,12 @@ android {
     configureAppSigningConfigsForRelease(project)
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
 fun configureAppSigningConfigsForRelease(project: Project) {
     val keystorePath: String? = System.getenv("KEYSTORE_PATH")
     if (keystorePath.isNullOrBlank()) {
@@ -218,13 +206,11 @@ dependencies {
     implementation(libs.androidx.navigation.fragment.ktx)
     implementation(libs.androidx.navigation.ui.ktx)
 
-    implementation(libs.okhttp)
-
     implementation(libs.fastjson)
-    implementation(libs.kotlinx.serialization)
-    implementation(libs.kotlin.reflect)
 
-    implementation(libs.bugly)
+    // BaiduLBS_Android.jar（百度定位 SDK）运行时依赖 okhttp：
+    // 删除会导致 :remote 进程 NoClassDefFoundError: okhttp3/OkHttpClient$Builder
+    implementation(libs.okhttp)
 
     implementation(libs.geotools)
     implementation(fileTree(mapOf(
@@ -238,21 +224,17 @@ dependencies {
 }
 
 fun getGitCommitCount(): Int {
-    val out = ByteArrayOutputStream()
-    exec {
-        commandLine("git", "rev-list", "--count", "HEAD")
-        standardOutput = out
-    }
-    return out.toString().trim().toInt()
+    return runCatching {
+        val p = Runtime.getRuntime().exec(arrayOf("git", "rev-list", "--count", "HEAD"))
+        p.inputStream.bufferedReader().readText().trim().toInt()
+    }.getOrDefault(1)
 }
 
 fun getGitCommitHash(): String {
-    val out = ByteArrayOutputStream()
-    exec {
-        commandLine("git", "rev-parse", "--short", "HEAD")
-        standardOutput = out
-    }
-    return out.toString().trim()
+    return runCatching {
+        val p = Runtime.getRuntime().exec(arrayOf("git", "rev-parse", "--short", "HEAD"))
+        p.inputStream.bufferedReader().readText().trim()
+    }.getOrDefault("unknown")
 }
 
 fun getVersionCode(): Int {

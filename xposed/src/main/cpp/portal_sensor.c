@@ -1,0 +1,933 @@
+/*
+ * Binder 外周传感器模拟 —— system_server 侧原生注入层（实验性）。
+ *
+ * 目标：**只 hook 系统框架，不向目标应用注入任何东西**。
+ *
+ * 原理
+ * ----
+ * 应用拿到的传感器事件，最终都来自系统框架的 SensorService：它从 HAL 取事件
+ * （AIDL HAL 走 FMQ，见下），再按各客户端的注册情况分发到对应的 BitTube
+ * （binder 建立的事件通道）。我们不动 HAL、也不动应用，而是挂在
+ * **HAL 包装器的事件出口**上：
+ *
+ *     SensorService::threadLoop
+ *        → mSensorDevice.poll(buf, n)          [libsensorservice.so, 内联]
+ *        → mHalWrapper->supportsMessageQueues() [虚调用]
+ *        → mHalWrapper->pollFmq(buf, n)         [虚调用] ← 本机实际走这条
+ *          （或 mHalWrapper->poll(buf, n)，老式轮询 HAL 走这条）
+ *        → 我们的 hook：丢掉真实的"被接管类型"事件，追加自产事件
+ *        → 框架照常做路由/过滤/批处理/唤醒锁
+ *
+ * 于是：
+ *   1. 所有客户端（含不在 LSPosed 作用域内的应用、以及走 NDK ASensorEventQueue
+ *      的原生消费者）都拿到模拟数据——**目标应用零 hook**；
+ *   2. 注入的数据由我们自己生成，HAL 报什么、准不准、有没有在被别人用，都不影响
+ *      推送内容——**完全隔离**；
+ *   3. 真实传感器若在动（设备实际被拿起/晃动），其数据被丢弃，不会和虚拟世界
+ *      互相矛盾。
+ *
+ * 为什么 poll 和 pollFmq 都要挂：本机 AIDL HAL 的 `poll()` 是个 `return 0` 的空实现，
+ * 框架走的是 `pollFmq`（FMQ 阻塞读）。只挂 `poll` 等于挂在没人走的路上——实测如此。
+ *
+ * 为什么不是 ioctl / 不是直接改 HAL
+ * --------------------------------
+ * 本机（Android 16 + 高通/OPPO）的传感器 HAL 是**独立 vendor 进程**里的 AIDL 服务
+ * （vendor.oplusSensor-aidl-1），ioctl 发生在那个进程里，LSPosed 注入不到；
+ * 而框架内的这道事件出口是同一份数据的**上游唯一汇合点**，改这里等价于换掉整个
+ * HAL，却不需要内核/驱动层面的改动。因此这里刻意不走 ioctl。
+ *
+ * 符号从哪来
+ * ----------
+ * 目标函数是隐藏可见性（dlsym 拿不到），地址由 Java 侧读平台库的 mini debug info
+ * 解析后传进来（见 LibSymbols.kt）。**本文件不做任何地址猜测**：
+ *   · 每个偏移都必须落在模块的可执行段内，否则拒绝；
+ *   · 改写的唯一条件是该位置当前正好存着"那个函数的指针"（vtable 槽核对）。
+ * 对不上就什么都不做——解析错、ROM 不同、库被换过，都只是功能不生效，不会写坏
+ * 系统进程（这条铁律是踩过一次段错误换来的）。
+ */
+#include <dlfcn.h>
+#include <elf.h>
+#include <jni.h>
+#include <link.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/system_properties.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "virtual_world.h"
+
+#define LOG_TAG "PortalSensor"
+#include <android/log.h>
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+
+typedef long (*ps_poll_fn)(void *self, portal_sensor_event_t *events, size_t count);
+
+/*
+ * 「应用期望频率」的入口：`SensorEventConnection::enableDisable`
+ * ------------------------------------------------------------------
+ * 应用调 `registerListener` 时的采样周期一路走到**原生**这一层才落地
+ * （Java 侧只是转发给 `ISensorEventConnection.enableDisable`），所以频率只能在
+ * 这里取。签名（由本机固件的 mini debug info 符号 `...enableDisableEiblli` 核对）：
+ *     (int handle, bool enabled, int64 samplingPeriodNs, int64 maxBatchReportLatencyNs,
+ *      int reservedFlags)
+ * 它是虚函数 ⇒ `.data.rel.ro` 里有对应的 vtable 槽 ⇒ 沿用与 poll 完全相同的
+ * "按值找槽、只改相等槽"改写方式，不引入 inline hook 那种风险类别。
+ *
+ * 调用时刻仍在 binder 线程里，因此可以直接问 `IPCThreadState::getCallingUid()`
+ * 拿到**发起请求的应用 uid**（不需要去读连接对象的私有字段——那些偏移才是真脆弱的东西）。
+ */
+typedef int (*ps_enable_fn)(void *self, int handle, int enabled, long long period_ns,
+                           long long batch_ns, int flags);
+
+#define MAX_SEGS 8
+/*
+ * install 偏移数组的索引契约（Kotlin 侧同名常量见 hooks/sensor/InstallOffsets.kt，必须同序）：
+ *   0 relroAddr · 1 relroSize · 2 poll(AIDL) · 3 pollFmq(AIDL) · 4 poll(HIDL) · 5 pollFmq(HIDL)
+ *   6 enableDisable（可选：老版本 Kotlin 只传 6 项）
+ */
+#define VW_INSTALL_OFFSET_COUNT 7
+#define VW_INSTALL_OFFSET_REQUIRED 6
+
+#define MAX_TARGETS 4
+
+/* 采样率请求记录（环形，最近 EN_REQ_CAP 条；只读观测，不影响框架逻辑） */
+#define EN_REQ_CAP 32
+typedef struct {
+    int handle;
+    int enabled;
+    int uid;
+    long long period_ns;
+    long long batch_ns;
+    long long at_ns; /* CLOCK_BOOTTIME */
+} ps_en_req_t;
+
+static ps_en_req_t g_en_req[EN_REQ_CAP];
+static int g_en_req_head = 0;   /* 下一个写入位置 */
+static int g_en_req_count = 0;  /* 已记录条数（≤ EN_REQ_CAP） */
+static int g_en_req_total = 0;  /* 累计条数（诊断） */
+static ps_enable_fn g_en_orig = NULL;
+static int g_en_hooked = 0;
+static pthread_mutex_t g_en_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * 打开 libbinder 拿 `IPCThreadState`（为了知道"谁"在请求采样率）。
+ *
+ * 为什么不能直接 `dlopen("libbinder.so")`：本模块的 .so 是 LSPosed 从模块 APK 的
+ * lib 目录 `System.load` 进来的，属于**受限链接器命名空间**，看不到 /system/lib64 ——
+ * 实测两条 `dlopen` 都失败（状态码留在 `uidapi=nodlopen` 里）。
+ * 因此用 `android_get_exported_namespace()` + `android_dlopen_ext()`（都从 libdl 里
+ * **dlsym**，不写进链接依赖，避免符号缺失时整个 .so 装不起来）从 default 命名空间打开。
+ */
+static int g_uid_api_state = 0; /* 1=ok 2=dlopen 全失败 3=dlsym 失败 4=命名空间失败 */
+static void *ps_dlopen_libbinder(void) {
+    void *h = dlopen("libbinder.so", RTLD_NOW);
+    if (h == NULL) h = dlopen("/system/lib64/libbinder.so", RTLD_NOW);
+    if (h != NULL) return h;
+
+    void *dl = dlopen("libdl.so", RTLD_NOW);
+    if (dl == NULL) return NULL;
+    void *(*get_ns)(const char *) = (void *(*)(const char *)) dlsym(
+            dl, "android_get_exported_namespace");
+    void *(*dlopen_ext)(const char *, int, const void *) = (void *(*)(const char *, int,
+                                                                      const void *)) dlsym(
+            dl, "android_dlopen_ext");
+    if (get_ns == NULL || dlopen_ext == NULL) {
+        g_uid_api_state = 4;
+        return NULL;
+    }
+    static const char *names[] = {"default", "system", "sphal", "vndk"};
+    for (int i = 0; i < 4; i++) {
+        void *ns = get_ns(names[i]);
+        if (ns == NULL) continue;
+        /* android_dlopen_ext_info 的首字段就是 library_namespace；给足余量并清零 */
+        struct {
+            const void *ns;
+            long long pad[8];
+        } info;
+        memset(&info, 0, sizeof(info));
+        info.ns = ns;
+        h = dlopen_ext("/system/lib64/libbinder.so", RTLD_NOW, &info);
+        if (h != NULL) return h;
+    }
+    return NULL;
+}
+
+/** 当前 binder 事务的调用方 uid（失败返回 -1） */
+static int ps_calling_uid(void) {
+    static void *(*self_fn)(void) = NULL;
+    static int (*uid_fn)(const void *) = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        void *h = ps_dlopen_libbinder();
+        if (h == NULL) {
+            g_uid_api_state = 2;
+        } else {
+            self_fn = (void *(*)(void)) dlsym(h, "_ZN7android14IPCThreadState4selfEv");
+            uid_fn = (int (*)(const void *)) dlsym(
+                    h, "_ZNK7android14IPCThreadState13getCallingUidEv");
+            g_uid_api_state = (self_fn != NULL && uid_fn != NULL) ? 1 : 3;
+        }
+    }
+    if (self_fn == NULL || uid_fn == NULL) return -1;
+    void *st = self_fn();
+    return st == NULL ? -1 : uid_fn(st);
+}
+
+static void ps_record_enable(int handle, int enabled, long long period_ns, long long batch_ns) {
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    int uid = ps_calling_uid();
+    pthread_mutex_lock(&g_en_lock);
+    ps_en_req_t *r = &g_en_req[g_en_req_head];
+    r->handle = handle;
+    r->enabled = enabled;
+    r->uid = uid;
+    r->period_ns = period_ns;
+    r->batch_ns = batch_ns;
+    r->at_ns = now;
+    g_en_req_head = (g_en_req_head + 1) % EN_REQ_CAP;
+    if (g_en_req_count < EN_REQ_CAP) g_en_req_count++;
+    g_en_req_total++;
+    pthread_mutex_unlock(&g_en_lock);
+}
+
+static int hook_enable_disable(void *self, int handle, int enabled, long long period_ns,
+                               long long batch_ns, int flags) {
+    ps_record_enable(handle, enabled, period_ns, batch_ns);
+    if (g_en_orig != NULL) return g_en_orig(self, handle, enabled, period_ns, batch_ns, flags);
+    return 0;
+}
+
+/* 潜在入口：poll / pollFmq × AIDL / HIDL（本机 AIDL，但 HIDL 也一起覆盖） */
+typedef struct {
+    const char *name;
+    uintptr_t off;        /* Java 传来的链接期偏移 */
+    ps_poll_fn orig;
+    ps_poll_fn hook;
+} ps_target_t;
+
+static uintptr_t g_base = 0; /* libsensorservice.so 加载基址 */
+static char g_path[256];
+static int g_patched = 0;
+static int g_installed = 0;
+
+/*
+ * 投递节拍源：0 = poll 路径（HAL 轮询驱动，现状），1 = 运行时通道（Java 侧泵线程驱动）。
+ * 两者**互斥**——同时开会让同一条事件送两份。默认 0（开关关闭时行为逐位不变）。
+ */
+static int g_rt_clock = 0;
+
+/*
+ * 步数两条流（TYPE_STEP_COUNTER/DETECTOR）改由 **poll 路径**注入。
+ * 缘由：实测 Java 客户端从运行时通道拿到的计数器值是**陈旧恒定值**（标记值实验证明我们的值没到），
+ * 而 NDK 客户端能看到真值 —— 说明该类型在"给 Java 客户端投递"这条路上被换值。
+ * poll 路径此前是能把正确值送到应用的，故把这两条流放回去，其余类型仍走运行时通道。
+ */
+static int g_steps_via_poll = 0;
+
+static int is_step_type(int32_t type) { return type == 18 || type == 19; }
+
+/*
+ * 通用出口观测器：记录**我们没有接管**的类型的到达情况（类型 / 条数 / 最近值 / 最近时间）。
+ * 目的：厂商私有传感器（如 pedometer_minute 33171034、oplus_activity_recognition 33171037）
+ * 也在同一个出口上，应用可能从它们读步频/活动 —— 只监控、不改写，用于判断
+ * "公版在走、私版不动"这类不自洽。槽位少、无锁（诊断用途，允许竞态）。
+ */
+#define OBS_SLOTS 24
+typedef struct {
+    int32_t type;
+    long long count;
+    float last;
+    long long last_ts;
+    long long first_ts;
+} obs_slot_t;
+static obs_slot_t g_obs[OBS_SLOTS];
+
+static void obs_note(int32_t type, float v0, long long ts) {
+    if (type <= 0) return;
+    int free_slot = -1;
+    for (int i = 0; i < OBS_SLOTS; i++) {
+        if (g_obs[i].type == type) {
+            g_obs[i].count++;
+            g_obs[i].last = v0;
+            g_obs[i].last_ts = ts;
+            return;
+        }
+        if (free_slot < 0 && g_obs[i].type == 0) free_slot = i;
+    }
+    if (free_slot >= 0) {
+        g_obs[free_slot].type = type;
+        g_obs[free_slot].count = 1;
+        g_obs[free_slot].last = v0;
+        g_obs[free_slot].first_ts = ts;
+        g_obs[free_slot].last_ts = ts;
+    }
+}
+
+/** 把观测到的**私有类型**（type >= 0x10000）写成 "33171034:120/min:v=37 ..." */
+static void obs_dump(char *out, size_t out_size) {
+    if (out == NULL || out_size == 0) return;
+    size_t used = 0;
+    out[0] = '\0';
+    for (int i = 0; i < OBS_SLOTS; i++) {
+        if (g_obs[i].type < 0x10000 || g_obs[i].count == 0) continue;
+        long long span = g_obs[i].last_ts - g_obs[i].first_ts;
+        long long per_min = 0;
+        if (span > 0) per_min = (long long) ((double) g_obs[i].count * 6e10 / (double) span);
+        int w = snprintf(out + used, out_size - used, "%s%d:%lld/min:v=%.3f",
+                         used ? " " : "", g_obs[i].type, per_min, (double) g_obs[i].last);
+        if (w > 0) used += (size_t) w;
+        if (used + 48 >= out_size) break;
+    }
+    if (used == 0) snprintf(out, out_size, "none");
+}
+static ps_target_t g_targets[MAX_TARGETS];
+static int g_target_count = 0;
+static int g_seen_handle[256]; /* 观测到的 type→handle（无锁快查，只做首见登记） */
+
+static struct {
+    uintptr_t start, end;
+} g_segs[MAX_SEGS];
+static int g_seg_count = 0;
+static uintptr_t g_exec_start[MAX_SEGS], g_exec_end[MAX_SEGS];
+static int g_exec_count = 0;
+
+/* ------------------------------------------------------------------ */
+/* 模块定位与地址合法性                                                */
+/* ------------------------------------------------------------------ */
+
+static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void) size;
+    const char *want = (const char *) data;
+    if (info->dlpi_name == NULL || info->dlpi_name[0] == '\0') return 0;
+    const char *slash = strrchr(info->dlpi_name, '/');
+    const char *name = slash ? slash + 1 : info->dlpi_name;
+    if (strcmp(name, want) != 0) return 0;
+    g_base = (uintptr_t) info->dlpi_addr;
+    snprintf(g_path, sizeof(g_path), "%s", info->dlpi_name);
+    g_seg_count = 0;
+    g_exec_count = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        uintptr_t s = g_base + ph->p_vaddr;
+        uintptr_t e = s + ph->p_memsz;
+        if (g_seg_count < MAX_SEGS) {
+            g_segs[g_seg_count].start = s;
+            g_segs[g_seg_count].end = e;
+            g_seg_count++;
+        }
+        if ((ph->p_flags & PF_X) && g_exec_count < MAX_SEGS) {
+            g_exec_start[g_exec_count] = s;
+            g_exec_end[g_exec_count] = e;
+            g_exec_count++;
+        }
+    }
+    return 1; /* 停止遍历 */
+}
+
+static int addr_is_executable(uintptr_t addr) {
+    for (int i = 0; i < g_exec_count; i++) {
+        if (addr >= g_exec_start[i] && addr < g_exec_end[i]) return 1;
+    }
+    return 0;
+}
+
+/** [from, to) 是否完整落在一个已映射的 PT_LOAD 段内——扫描/改写前必须先过这一关，
+ *  否则一个算错的地址就是 system_server 的段错误（已踩过一次）。 */
+static int range_is_mapped(uintptr_t from, uintptr_t to) {
+    for (int i = 0; i < g_seg_count; i++) {
+        if (from >= g_segs[i].start && to <= g_segs[i].end) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 指针改写（vtable 槽 = 数据改写，不改代码段）                          */
+/* ------------------------------------------------------------------ */
+
+static int patch_slot(uintptr_t where, uintptr_t expected, uintptr_t replacement) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start = where & ~(uintptr_t) (page - 1);
+    uintptr_t end = (where + sizeof(void *) + page - 1) & ~(uintptr_t) (page - 1);
+    if (mprotect((void *) start, end - start, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("mprotect(RW) failed at 0x%lx", (unsigned long) start);
+        return -1;
+    }
+    int ok = 0;
+    uintptr_t *slot = (uintptr_t *) where;
+    if (*slot == expected) {
+        *slot = replacement;
+        ok = 1;
+    }
+    mprotect((void *) start, end - start, PROT_READ);
+    __builtin___clear_cache((char *) start, (char *) end);
+    return ok ? 0 : -1;
+}
+
+/*
+ * 在 .data.rel.ro 里找"正好指向 [target] 的函数指针"并换成 [replacement]。
+ * 虚函数表就在这个节里：按值核对比按结构体偏移猜测稳，也不依赖 vtable 符号
+ * （平台的 vtable 符号不在 mini debug info 里）。找不到就一个都不改。
+ */
+static int hook_vtable_slot(uintptr_t relro_addr, uintptr_t relro_size, uintptr_t target,
+                            uintptr_t replacement, const char *name) {
+    if (g_base == 0 || relro_size == 0 || target == 0) return 0;
+    /* relro_addr 是**链接期**地址（.data.rel.ro 的 sh_addr），必须加上模块基址 */
+    uintptr_t from = g_base + relro_addr;
+    uintptr_t to = from + relro_size;
+    if (!range_is_mapped(from, to)) {
+        LOGE("refusing to scan 0x%lx..0x%lx: not inside any mapped PT_LOAD of %s",
+             (unsigned long) from, (unsigned long) to, g_path);
+        return 0;
+    }
+    int hits = 0;
+    for (uintptr_t p = from; p + sizeof(void *) <= to; p += sizeof(void *)) {
+        if (*(uintptr_t *) p != target) continue;
+        if (patch_slot(p, target, replacement) == 0) {
+            hits++;
+            LOGI("hook %s: vtable slot @ libsensorservice.so+0x%lx -> %p", name,
+                 (unsigned long) (p - g_base), (void *) replacement);
+        }
+    }
+    if (hits == 0) {
+        LOGW("%s: no vtable slot holds 0x%lx (target moved?)", name,
+             (unsigned long) (target - g_base));
+    }
+    return hits;
+}
+
+/* ------------------------------------------------------------------ */
+/* 事件出口：压制真实事件 + 追加自产事件                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * type → handle 映射**只从真实事件里学**（首个事件到达即登记，随后该类型完全由本模块
+ * 接管）。刻意不用 HAL 的 getSensorsList()：它返回的是平台内部 `std::vector<Sensor>`
+ * （元素大小随版本变化，实测本机是 96+8=104 字节，而 sensor_t 是 96），按 sensor_t
+ * 结构去遍历会错位，读出垃圾 handle 并**覆盖掉正确的映射**——实测踩到过
+ * （garbage 0xb4000076 覆盖 0xb）。猜错的后果是把 A 传感器的数据写进 B 传感器，
+ * 比不注入更糟，所以宁可不猜：HAL 完全静默的传感器不会被凭空注入。
+ */
+
+static long post_process(portal_sensor_event_t *buf, long n, size_t cap) {
+    if (!vw_is_active()) return n;
+
+    long kept = 0;
+    long long suppressed = 0;
+    for (long i = 0; i < n; i++) {
+        portal_sensor_event_t *e = &buf[i];
+        int type = e->type;
+        if (type > 0 && type < 256 && g_seen_handle[type] == 0 && e->sensor != 0) {
+            /* 首见登记（无锁快查；同一类型只进来一次） */
+            g_seen_handle[type] = e->sensor;
+            vw_set_handle(type, e->sensor, e->flags);
+        }
+        /* 真实事件先喂给虚拟世界看一眼（取真实计数器值做接管基线） */
+        vw_note_real_event(type, e->data.f);
+        /* 未接管的类型只做观测（厂商私有传感器在同一个出口上） */
+        if (!vw_owns_type(type)) obs_note(type, e->data.f[0], e->timestamp);
+        if (vw_owns_type(type)) {
+            suppressed++;
+            continue;
+        }
+        if (kept != i) buf[kept] = *e;
+        kept++;
+    }
+    if (suppressed > 0) vw_note_suppressed(suppressed);
+
+    /*
+     * 投递互斥：运行时通道接管投递时，这里的角色只剩"压制真实事件"——
+     * 绝不能再注入一份（同一条事件送两份 = 应用侧翻倍/抖动）。
+     * 生成与栅格推进改由 Java 侧泵线程按时钟调用 vw_generate（见 runtimeFrame）。
+     */
+    /*
+     * 运行时通道接管投递时，这里只剩"压制真实事件"——**但归 poll 路径的那些类型例外**
+     * （见 vw_is_poll_type：3 值类型的精度字段只能靠 poll 路径落地）。
+     * 两个消费者共用同一条时间轴，各自只取自己那批，对方的那批进延迟队列（不会丢）。
+     */
+    if (g_rt_clock && !vw_poll_types_enabled()) return kept;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts); /* 传感器事件时间基（= elapsedRealtimeNanos） */
+    long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    long room = (long) cap - kept;
+    if (room <= 0) return kept;
+    /* 运行时通道在跑 ⇒ 这里只要 poll 那批；否则 poll 是唯一出口 ⇒ 全都要 */
+    kept += vw_generate(buf + kept, (int) room, now, g_rt_clock ? 1 : 2);
+    return kept;
+}
+
+static long run_target(int idx, void *self, portal_sensor_event_t *events, size_t count) {
+    ps_target_t *t = &g_targets[idx];
+    long n = t->orig(self, events, count);
+    return post_process(events, n, count);
+}
+
+static long hook_target0(void *s, portal_sensor_event_t *e, size_t c) { return run_target(0, s, e, c); }
+static long hook_target1(void *s, portal_sensor_event_t *e, size_t c) { return run_target(1, s, e, c); }
+static long hook_target2(void *s, portal_sensor_event_t *e, size_t c) { return run_target(2, s, e, c); }
+static long hook_target3(void *s, portal_sensor_event_t *e, size_t c) { return run_target(3, s, e, c); }
+static ps_poll_fn HOOKS[MAX_TARGETS] = {&hook_target0, &hook_target1, &hook_target2, &hook_target3};
+
+/* ------------------------------------------------------------------ */
+/* 运行时投递通道的取值个数（必须与框架 JNI 的 switch 一致）             */
+/* ------------------------------------------------------------------ */
+
+static int value_count_for_type(int type) {
+    switch (type) {
+        case PS_TYPE_ACCELEROMETER:
+        case PS_TYPE_MAGNETIC_FIELD:
+        case PS_TYPE_ORIENTATION:
+        case PS_TYPE_GYROSCOPE:
+        case PS_TYPE_GRAVITY:
+        case PS_TYPE_LINEAR_ACCELERATION:
+            return 3;   /* 框架 JNI 明确要求恰好 3 个，否则丢弃 */
+        case PS_TYPE_MAGNETIC_FIELD_UNCALIBRATED:
+        case PS_TYPE_GYROSCOPE_UNCALIBRATED:
+        case PS_TYPE_ACCELEROMETER_UNCALIBRATED:
+            return 6;
+        case PS_TYPE_ROTATION_VECTOR:
+        case PS_TYPE_GAME_ROTATION_VECTOR:
+        case PS_TYPE_GEOMAGNETIC_ROTATION_VECTOR:
+            return 4;
+        case PS_TYPE_STEP_DETECTOR:
+            return 1;
+        case PS_TYPE_STEP_COUNTER:
+            /*
+             * 计数器是 **int64**（真机写在 `u64.step_counter`，客户端也按 int64 读），
+             * 而框架 JNI 的运行时入口只接受 `float[]`、按个数 memcpy 到 `data` —— 所以要
+             * 用**两个 float 槽**承载这 8 个字节（低 32 位在前）。type 19 不在 JNI 那两个
+             * "恰好 1/3 个"的掩码里，走通用分支，个数 2 是允许的。
+             */
+            return 2;
+        default:
+            return 3;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 安装                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * offsets = [relroAddr, relroSize, pollAidl, fmqAidl, pollHidl, fmqHidl, enableDisable]
+ * （第 7 项可选：老版本 Kotlin 只传 6 项时不挂采样率观测，其余功能不受影响）
+ */
+static int do_install(const jlong *o, int olen) {
+    if (g_installed) return 1;
+    if (g_base == 0) {
+        if (!dl_iterate_phdr(phdr_cb, (void *) "libsensorservice.so")) {
+            LOGE("libsensorservice.so not loaded in this process");
+            return 0;
+        }
+    }
+    LOGI("libsensorservice.so base=0x%lx path=%s", (unsigned long) g_base, g_path);
+
+    uintptr_t relro_addr = (uintptr_t) o[0];
+    uintptr_t relro_size = (uintptr_t) o[1];
+    if (relro_addr == 0 || relro_size == 0) {
+        LOGE("no .data.rel.ro range given - feature stays inert");
+        return 0;
+    }
+
+    struct {
+        const char *name;
+        jlong off;
+    } spec[MAX_TARGETS] = {
+        {"poll(AIDL)", o[2]},
+        {"pollFmq(AIDL)", o[3]},
+        {"poll(HIDL)", o[4]},
+        {"pollFmq(HIDL)", o[5]},
+    };
+
+    g_target_count = 0;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (spec[i].off == 0) continue;
+        uintptr_t addr = g_base + (uintptr_t) spec[i].off;
+        if (!addr_is_executable(addr)) {
+            LOGE("%s offset 0x%lx not executable - rejected", spec[i].name,
+                 (unsigned long) spec[i].off);
+            continue;
+        }
+        ps_target_t *t = &g_targets[g_target_count];
+        t->name = spec[i].name;
+        t->off = (uintptr_t) spec[i].off;
+        t->orig = (ps_poll_fn) addr;
+        t->hook = HOOKS[g_target_count];
+        g_target_count++;
+    }
+
+    for (int i = 0; i < g_target_count; i++) {
+        g_patched += hook_vtable_slot(relro_addr, relro_size, (uintptr_t) g_targets[i].orig,
+                                      (uintptr_t) g_targets[i].hook, g_targets[i].name);
+    }
+    if (g_patched == 0) {
+        LOGE("no vtable slot patched - feature stays inert");
+        return 0;
+    }
+    g_installed = 1;
+    LOGI("installed: %d vtable slot(s) patched", g_patched);
+
+    /*
+     * 采样率观测：`SensorEventConnection::enableDisable` 的 vtable 槽（见文件头说明）。
+     * 它**只读**——记录应用请求的采样周期/批量延迟 + 调用方 uid，然后原样放行。
+     *
+     * **默认停用**（`setprop debug.portalex.ratehook 1` 才挂）：实测一挂上这个槽，
+     * system_server 就会在启动后不久 / 取诊断状态时死掉（两次；dropbox 只有
+     * "can not get efficacious log"，拿不到有效堆栈），而同一份改动去掉它就稳。
+     * 这个功能不该拿系统进程去赌，所以开关留在这里、默认不生效；频率观测暂由
+     * **纯 Java 的 dump 路**（SensorRateProbe）承担——它零 hook、零原生改动。
+     */
+    {
+        /* 3 值类型默认走 poll（为了精度字段）；debug.portalex.accviapoll=0 可关掉做 A/B */
+        char avh[PROP_VALUE_MAX] = {0};
+        int av = (__system_property_get("debug.portalex.accviapoll", avh) > 0 && avh[0] == '0');
+        vw_set_acc_via_poll(!av);
+    }
+    char rhv[PROP_VALUE_MAX] = {0};
+    int ratehook = (__system_property_get("debug.portalex.ratehook", rhv) > 0 && rhv[0] == '1');
+    if (!ratehook) {
+        LOGI("sampling-rate observer: parked (debug.portalex.ratehook != 1)");
+    } else if (olen > MAX_TARGETS + 2 && o[MAX_TARGETS + 2] != 0) {
+        uintptr_t en_addr = g_base + (uintptr_t) o[MAX_TARGETS + 2];
+        if (!addr_is_executable(en_addr)) {
+            LOGE("enableDisable offset 0x%lx not executable - rejected",
+                 (unsigned long) o[MAX_TARGETS + 2]);
+        } else {
+            g_en_orig = (ps_enable_fn) en_addr;
+            int hits = hook_vtable_slot(relro_addr, relro_size, en_addr,
+                                        (uintptr_t) &hook_enable_disable, "enableDisable");
+            g_en_hooked = hits > 0 ? 1 : 0;
+            LOGI("sampling-rate observer: %s (%d slot)", g_en_hooked ? "on" : "off", hits);
+        }
+    }
+    /*
+     * 说明：这里**只**做 HAL 事件出口（poll/pollFmq）的接管。
+     * "投递 100% 可控"的那条路（框架的运行时传感器）改由 **Java 层**实现——
+     * 框架本身就把 `registerRuntimeSensorNative` / `sendRuntimeSensorEventNative`
+     * 暴露在 system_server 的 Java 侧，走那条路不需要任何原生代码，也就没有
+     * 自建对象/虚表/ABI 的风险（上一版原生探针崩过两次 system_server，
+     * 原因与教训见 docs/binder-sensor-mock.md「架构翻新」）。
+     */
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* JNI                                                                 */
+/* ------------------------------------------------------------------ */
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void) vm;
+    (void) reserved;
+    vw_init();
+    LOGI("native layer loaded (pid=%d)", getpid());
+    return JNI_VERSION_1_6;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_install(JNIEnv *env, jobject thiz,
+                                                                jlongArray offsets) {
+    (void) thiz;
+    if (offsets == NULL) return JNI_FALSE;
+    jsize len = (*env)->GetArrayLength(env, offsets);
+    /* 索引契约见 Kotlin 侧 InstallOffsets：0=relroAddr 1=relroSize 2..5=四个 poll 出口
+     * 6=enableDisable（可选）。少一项就不是我们认识的协议 —— 宁可明确不装。 */
+    if (len < VW_INSTALL_OFFSET_REQUIRED) {
+        LOGE("install: offsets array too short (%d < %d)", (int) len, VW_INSTALL_OFFSET_REQUIRED);
+        return JNI_FALSE;
+    }
+    int want = (len >= VW_INSTALL_OFFSET_COUNT) ? VW_INSTALL_OFFSET_COUNT : VW_INSTALL_OFFSET_REQUIRED;
+    jlong vals[MAX_TARGETS + 3] = {0};
+    (*env)->GetLongArrayRegion(env, offsets, 0, want, vals);
+    return do_install(vals, want) ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * 「应用期望频率」快照（诊断/展示用）。
+ *
+ * 内容：观测是否挂上 + 累计条数 + 最近若干条 `handle / uid / 采样周期 / 批量延迟 / 距今多久`。
+ * 语义提醒：拿到的 `period` 是应用的**原始请求**；框架随后会经 `capRates()`
+ * （无 HIGH_SAMPLING_RATE_SENSORS 的应用被压到 200Hz）与厂商扩展
+ * `ISensorEventConnectionExt::adjustSamplingPeriodBaseOverride` 调整成**采用值**。
+ * 若要"像"，应以框架采用值为准（框架 dump 里的 `selected`）。
+ */
+JNIEXPORT jstring JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_enableRequests(JNIEnv *env, jobject thiz) {
+    (void) thiz;
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    char buf[768];
+    size_t used = 0;
+    pthread_mutex_lock(&g_en_lock);
+    int n = g_en_req_count;
+    used += (size_t) snprintf(buf + used, sizeof(buf) - used, "obs=%d total=%d n=%d uidapi=%s",
+                              g_en_hooked, g_en_req_total, n,
+                              g_uid_api_state == 1 ? "ok" :
+                              g_uid_api_state == 2 ? "nodlopen" :
+                              g_uid_api_state == 3 ? "nosym" : g_uid_api_state == 4 ? "nons" : "untried");
+    /* 从最新往回打印，最多 6 条（最近的在最前，便于一眼看到"谁刚要了多快"） */
+    for (int k = 0; k < n && k < 6 && used < sizeof(buf) - 96; k++) {
+        int idx = (g_en_req_head - 1 - k + EN_REQ_CAP * 2) % EN_REQ_CAP;
+        ps_en_req_t *r = &g_en_req[idx];
+        double age = (double) (now - r->at_ns) / 1e9;
+        used += (size_t) snprintf(buf + used, sizeof(buf) - used,
+                                  " [h=0x%x uid=%d %s req=%.1fms batch=%.1fms %.1fs]",
+                                  r->handle, r->uid, r->enabled ? "on" : "off",
+                                  r->period_ns / 1e6, r->batch_ns / 1e6, age);
+    }
+    pthread_mutex_unlock(&g_en_lock);
+    return (*env)->NewStringUTF(env, buf);
+}
+
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setActive(JNIEnv *env, jobject thiz,
+                                                                  jboolean active) {
+    (void) env;
+    (void) thiz;
+    vw_set_active(active ? 1 : 0);
+}
+
+/**
+ * 用框架自己的传感器表播种 type → handle（三元组 [type, handle, flags, ...]）。
+ * 不依赖真实事件，所以"不走路就没有事件的"步数传感器也能拿到 handle。
+ */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setHandleMap(JNIEnv *env, jobject thiz,
+                                                                     jlongArray triples) {
+    (void) thiz;
+    if (triples == NULL) return;
+    jsize len = (*env)->GetArrayLength(env, triples);
+    if (len < 3) return;
+    jlong *vals = (*env)->GetLongArrayElements(env, triples, NULL);
+    if (vals == NULL) return;
+    int mapped = 0;
+    for (jsize i = 0; i + 2 < len; i += 3) {
+        vw_seed_handle((int32_t) vals[i], (int32_t) vals[i + 1], (uint32_t) vals[i + 2]);
+        mapped++;
+    }
+    (*env)->ReleaseLongArrayElements(env, triples, vals, JNI_ABORT);
+    LOGI("seeded %d sensor handle(s) from framework list", mapped);
+}
+
+/**
+ * 投递节拍源开关（与 Java 侧的运行时通道泵线程一一对应）。
+ * 打开后 poll 出口只压制真实事件、不再注入；生成改由 [runtimeFrame] 驱动。
+ */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setRuntimeClock(JNIEnv *env, jobject thiz,
+                                                                        jboolean active) {
+    (void) env;
+    (void) thiz;
+    int v = active ? 1 : 0;
+    if (v == g_rt_clock) return;
+    g_rt_clock = v;
+    LOGI("delivery clock -> %s (poll path %s)", v ? "runtime" : "poll",
+         v ? "suppress-only" : "inject+suppress");
+}
+
+/**
+ * 取一帧"截至 now_nanos 应发出的事件"（运行时通道专用）。
+ *
+ * 每事件写 4 个 long（handle / type / timestamp / values 个数），值写进 [values]，
+ * 每事件占 16 个 float 槽（与 `sensors_event_t.data` 同宽）。**值个数必须与框架 JNI
+ * 的 switch 一致**：加速度/磁场/方向/陀螺仪/重力/线性加速度 恰好 3 个；
+ * 未校准三兄弟 6 个；旋转矢量三家 4 个；步数两兄弟 1 个。
+ * @return 写入的事件条数
+ */
+JNIEXPORT jint JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_runtimeFrame(JNIEnv *env, jobject thiz,
+                                                                    jlong now_nanos,
+                                                                    jlongArray meta,
+                                                                    jfloatArray values) {
+    (void) thiz;
+    if (!g_rt_clock || !vw_is_active() || meta == NULL || values == NULL) return 0;
+    enum { MAX_FRAME = 32, META_STRIDE = 4, VALUE_STRIDE = 16 };
+    portal_sensor_event_t buf[MAX_FRAME];
+    int n = vw_generate(buf, MAX_FRAME, (long long) now_nanos, 0 /*只要运行时那批*/);
+    if (n <= 0) return 0;
+
+    jsize mlen = (*env)->GetArrayLength(env, meta);
+    jsize vlen = (*env)->GetArrayLength(env, values);
+    int cap = (int) (mlen / META_STRIDE);
+    if (cap > n) cap = (int) n;
+    if (cap > (int) (vlen / VALUE_STRIDE)) cap = (int) (vlen / VALUE_STRIDE);
+    if (cap <= 0) return 0;
+
+    jlong *m = (*env)->GetLongArrayElements(env, meta, NULL);
+    jfloat *v = (*env)->GetFloatArrayElements(env, values, NULL);
+    if (m == NULL || v == NULL) {
+        if (m != NULL) (*env)->ReleaseLongArrayElements(env, meta, m, JNI_ABORT);
+        if (v != NULL) (*env)->ReleaseFloatArrayElements(env, values, v, JNI_ABORT);
+        return 0;
+    }
+    int out = 0;
+    for (int i = 0; i < cap; i++) {
+        m[out * META_STRIDE + 0] = buf[i].sensor;
+        m[out * META_STRIDE + 1] = buf[i].type;
+        m[out * META_STRIDE + 2] = buf[i].timestamp;
+        m[out * META_STRIDE + 3] = value_count_for_type(buf[i].type);
+        for (int k = 0; k < VALUE_STRIDE; k++) v[out * VALUE_STRIDE + k] = buf[i].data.f[k];
+        out++;
+    }
+    (*env)->ReleaseLongArrayElements(env, meta, m, 0);
+    (*env)->ReleaseFloatArrayElements(env, values, v, 0);
+    return out;
+}
+
+/**
+ * 客户端视角的"系统开机总步数"：最近一次发出的 STEP_COUNTER 值。
+ * 应用若用"间歇读总步数求差"的方式算步频，读到的就是它。
+ */
+/**
+ * 真实（HAL）STEP_COUNTER 的最近值 —— 模拟接管时的起点，用于保持"开机以来累计"连续。
+ * @return ≥0 = 已知；-1 = 还没见过真实计数器（无步数传感器 / 会话期间没收到过）
+ */
+JNIEXPORT jlong JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_realStepCounter(JNIEnv *env,
+                                                                        jobject thiz) {
+    (void) env;
+    (void) thiz;
+    return (jlong) vw_real_step_counter();
+}
+
+/** 步数两条流是否改由 poll 路径注入（见 g_steps_via_poll 的说明） */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setStepsViaPoll(JNIEnv *env, jobject thiz,
+                                                                        jboolean on) {
+    (void) env;
+    (void) thiz;
+    vw_set_steps_via_poll(on ? 1 : 0);
+    LOGI("steps via poll: %s", on ? "on" : "off");
+}
+
+JNIEXPORT jlong JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_stepCounterValue(JNIEnv *env,
+                                                                        jobject thiz) {
+    (void) env;
+    (void) thiz;
+    return (jlong) vw_step_counter_value();
+}
+
+/**
+ * 「按应用期望出数据」：把框架观测到的采用速率与活跃状态灌进栅格通道。
+ * 语义与真机对齐（HAL 按最快请求出力、框架广播给所有人），详见 virtual_world.h。
+ */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setChannelHint(
+        JNIEnv *env, jobject thiz, jint type, jlong period_ns, jlong batch_ns, jboolean active) {
+    (void) env;
+    (void) thiz;
+    vw_set_channel_hint((int32_t) type, (long long) period_ns, (long long) batch_ns,
+                        active ? 1 : 0);
+}
+
+/** 设置页「注入栅格分辨率」：Hz → 纳秒（0 = 自动） */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setGridHz(
+        JNIEnv *env, jobject thiz, jint hz) {
+    (void) env;
+    (void) thiz;
+    long long ns = 0;
+    if (hz > 0) ns = 1000000000LL / (long long) hz;
+    vw_set_tick_override(ns);
+    LOGI("grid override -> %d Hz (%lld ns)", (int) hz, ns);
+}
+
+/** 先清空活跃标记（缺席的类型即静默），随后由 Kotlin 按 dump 灌入活跃者 */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_clearChannelHints(
+        JNIEnv *env, jobject thiz) {
+    (void) env;
+    (void) thiz;
+    vw_clear_channel_hints();
+}
+
+/**
+ * Calibration 页：按索引设置某一路注入噪声的半宽（均匀分布 [−A,A]）。
+ * 索引表见 virtual_world.h 的 VW_NOISE_*（Kotlin 侧 NoiseProfile 顺序必须一致）。
+ */
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_setNoise(JNIEnv *env, jobject thiz,
+                                                                 jint index, jfloat amp) {
+    (void) env;
+    (void) thiz;
+    vw_set_noise((int) index, (float) amp);
+}
+
+/** 噪声档回读（诊断/回显，格式见 vw_dump_noise） */
+JNIEXPORT jstring JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_noiseProfile(JNIEnv *env, jobject thiz) {
+    (void) thiz;
+    char buf[320];
+    vw_dump_noise(buf, sizeof(buf));
+    return (*env)->NewStringUTF(env, buf);
+}
+
+JNIEXPORT void JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_updateState(    JNIEnv *env, jobject thiz, jdouble speed, jdouble azimuth, jboolean moving, jlong steps,
+    jlong now_nanos) {
+    (void) env;
+    (void) thiz;
+    vw_update_state(speed, azimuth, moving ? 1 : 0, (long long) steps, (long long) now_nanos);
+}
+
+JNIEXPORT jstring JNICALL
+Java_moe_fuqiuluo_xposed_hooks_sensor_BinderSensorNative_status(JNIEnv *env, jobject thiz) {
+    (void) thiz;
+    long long emitted = 0, dropped = 0, suppressed = 0;
+    vw_stats(&emitted, &dropped, &suppressed);
+    char buf[1024];
+    size_t used = 0;
+#define APPEND(...)                                                                     \
+    do {                                                                                \
+        if (used < sizeof(buf)) {                                                       \
+            int w = snprintf(buf + used, sizeof(buf) - used, __VA_ARGS__);               \
+            if (w > 0) used += (size_t) w;                                               \
+        }                                                                                \
+    } while (0)
+    APPEND("installed=%d patched=%d targets=%d active=%d base=0x%lx", g_installed, g_patched,
+           g_target_count, vw_is_active(), (unsigned long) g_base);
+    for (int i = 0; i < g_target_count; i++) {
+        APPEND(" [%s=0x%lx]", g_targets[i].name, (unsigned long) g_targets[i].off);
+    }
+    struct timespec now_ts;
+    clock_gettime(CLOCK_BOOTTIME, &now_ts);
+    long long now_ns = (long long) now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+    APPEND(" emitted=%lld dropped=%lld suppressed=%lld", emitted, dropped, suppressed);
+    APPEND(" steps=%lld step_rate=%d/min", vw_step_events_total(),
+           vw_step_rate_per_min(now_ns));
+    APPEND(" steps_boot=%lld", vw_step_counter_value());
+    APPEND(" steps_base=%lld", vw_real_step_counter());
+    char priv[320];
+    obs_dump(priv, sizeof(priv));
+    APPEND(" priv=[%s]", priv);
+    APPEND(" gait=%s", vw_gait_describe());
+    {
+        int pend = 0;
+        long long dropped = 0;
+        vw_defer_stats(&pend, &dropped);
+        APPEND(" tick=%.2fms polltypes=%d defer=%d/%lld", vw_tick_ns_dbg() / 1e6,
+               vw_poll_types_enabled(), pend, dropped);
+    }
+    {
+        char rates[256];
+        vw_dump_rates(rates, sizeof(rates));
+        APPEND(" rates=[%s]", rates);
+    }
+    char handles[256];
+    vw_dump_handles(handles, sizeof(handles));
+    APPEND(" handles=[%s]", handles);
+#undef APPEND
+    return (*env)->NewStringUTF(env, buf);
+}

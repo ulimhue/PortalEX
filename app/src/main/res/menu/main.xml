@@ -11,11 +11,19 @@
         app:showAsAction="ifRoom|collapseActionView"/>
 
     <item
+        android:id="@+id/action_map_controls"
+        android:orderInCategory="999"
+        android:icon="@drawable/baseline_more_vert_24"
+        android:title="地图控件"
+        android:visible="true"
+        app:showAsAction="always"/>
+
+    <item
         android:id="@+id/action_info"
         android:orderInCategory="100"
         android:icon="@drawable/baseline_info_outline_24"
         android:title="@string/action_info"
         android:visible="false"
-        app:actionViewClass="moe.fuqiuluo.portal.android.widget.DeveloperView"
+        app:actionViewClass="moe.fuqiuluo.portalex.android.widget.DeveloperView"
         app:showAsAction="ifRoom|collapseActionView"/>
 </menu>

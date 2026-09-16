@@ -14,12 +14,15 @@
         android:clickable="true"
         android:focusable="true" />
 
+    <!-- 地图类型切换已统一到右上角三点展开栏（单个「卫星图」复选框）：
+         此处仅保留不可见的 RadioGroup 作为内部状态源，代码路径与主界面一致。 -->
     <RadioGroup
         android:id="@+id/map_type_group"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|end"
-        android:layout_margin="8dp">
+        android:layout_margin="8dp"
+        android:visibility="gone">
 
         <RadioButton
             android:id="@+id/map_type_normal"
@@ -35,64 +38,22 @@
             android:layout_height="wrap_content" />
     </RadioGroup>
 
-    <LinearLayout
-        android:layout_width="match_parent"
+    <!-- 绘制准星：
+         绘制路线时记录的坐标取的是地图中心（baiduMap.mapStatus.target），
+         屏幕上没有任何参照物，拖图时无从判断落点在哪。此处叠一个居中的
+         准星，仅在绘制过程中显示。不可点击，因此不会拦截地图触摸事件。 -->
+    <ImageView
+        android:id="@+id/draw_crosshair"
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end">
-        <com.google.android.material.floatingactionbutton.FloatingActionButton
-            android:id="@+id/fab"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="@dimen/fab_margin"
-            android:layout_marginBottom="@dimen/fab_margin"
-            android:importantForAccessibility="no"
-            app:srcCompat="@drawable/baseline_keyboard_arrow_up_24"
-            app:fabSize="normal"/>
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center"
-            android:orientation="horizontal">
+        android:layout_gravity="center"
+        android:clickable="false"
+        android:contentDescription="@string/draw_crosshair"
+        android:focusable="false"
+        android:importantForAccessibility="no"
+        android:src="@drawable/ic_draw_crosshair"
+        android:visibility="gone"
+        tools:visibility="visible" />
 
-            <com.google.android.material.floatingactionbutton.FloatingActionButton
-                android:id="@+id/fab_start"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="@dimen/fab_margin"
-                android:contentDescription="@string/goto_location"
-                android:visibility="visible"
-                app:srcCompat="@drawable/baseline_add_location_24"
-                app:fabSize="mini"/>
 
-            <com.google.android.material.floatingactionbutton.FloatingActionButton
-                android:id="@+id/fab_rollback"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="@dimen/fab_margin"
-                android:contentDescription="@string/follow_location"
-                android:visibility="visible"
-                app:srcCompat="@drawable/baseline_rollback_24"
-                app:fabSize="mini"/>
-
-            <com.google.android.material.floatingactionbutton.FloatingActionButton
-                android:id="@+id/fab_complete"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="@dimen/fab_margin"
-                android:contentDescription="@string/goto_location"
-                android:visibility="visible"
-                app:srcCompat="@drawable/baseline_complete_24"
-                app:fabSize="mini"/>
-
-            <com.google.android.material.floatingactionbutton.FloatingActionButton
-                android:id="@+id/fab_my_location"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginBottom="@dimen/fab_margin"
-                android:contentDescription="@string/follow_location"
-                android:visibility="visible"
-                app:srcCompat="@drawable/baseline_my_location_24"
-                app:fabSize="mini"/>
-        </LinearLayout>
-    </LinearLayout>
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

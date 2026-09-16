@@ -11,6 +11,7 @@ import moe.fuqiuluo.xposed.utils.Logger
 import moe.fuqiuluo.xposed.utils.hookAllMethodsAfter
 import moe.fuqiuluo.xposed.utils.hookAllMethodsBefore
 import moe.fuqiuluo.xposed.utils.toClassOrThrow
+import kotlin.random.Random
 
 object BasicLocationHook: BaseLocationHook() {
     operator fun invoke(classLoader: ClassLoader) {
@@ -54,47 +55,18 @@ object BasicLocationHook: BaseLocationHook() {
                 mLocationsField.isAccessible = true
                 val mLocations = mLocationsField.get(locationResult) as ArrayList<*>
 
-                val originLocation = mLocations.firstOrNull() as? Location
-                    ?: Location(LocationManager.GPS_PROVIDER)
-
-                val location = Location(originLocation.provider)
-
-                val jitterLat = FakeLoc.jitterLocation()
-                location.latitude = jitterLat.first
-                location.longitude = jitterLat.second
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    location.isMock = false
+                // 统一走主注入路径（BaseLocationHook.injectLocation）：
+                // writeToParcel 是帧跨进程的必经关口，这里口径必须与推送链一致。
+                // **逐条注入并保留批次长度**：旧实现只取 first 再写回单元素 ArrayList，
+                // 批量位置（onLocationBatch / flush 批次）除首帧外全部丢失。
+                // **不凭空生成**：空批次（LocationResult.empty()）原样保持为空——
+                // 旧实现在这里补一帧 Location("gps")，等于把"这次没有位置"改成"有一次定位"。
+                // 非 Location 元素原样保留，长度/顺序不变。
+                val injected = ArrayList<Any?>(mLocations.size)
+                mLocations.forEach { item ->
+                    injected.add(if (item is Location) injectLocation(item) else item)
                 }
-                location.altitude = FakeLoc.offset_altitude
-                location.speed = originLocation.speed
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    location.speedAccuracyMetersPerSecond = 0F
-                }
-
-                location.time = originLocation.time
-                location.accuracy = originLocation.accuracy
-                var modBearing = FakeLoc.bearing % 360.0 + 0.0
-                if (modBearing < 0) {
-                    modBearing += 360.0
-                }
-                if (location.hasBearing()) {
-                    location.bearing = modBearing.toFloat()
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    location.bearingAccuracyDegrees = modBearing.toFloat()
-                }
-                location.elapsedRealtimeNanos = originLocation.elapsedRealtimeNanos
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    location.elapsedRealtimeUncertaintyNanos = originLocation.elapsedRealtimeUncertaintyNanos
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    location.verticalAccuracyMeters = originLocation.verticalAccuracyMeters
-                }
-                originLocation.extras?.let {
-                    location.extras = it
-                }
-
-                mLocationsField.set(locationResult, arrayListOf(location))
+                mLocationsField.set(locationResult, injected)
             }
         }.onFailure {
            Logger.error("Failed to hook LocationResult", it)
