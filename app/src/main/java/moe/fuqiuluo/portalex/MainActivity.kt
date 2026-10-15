@@ -5,6 +5,7 @@ import android.Manifest.permission.ACCESS_FINE_LOCATION
 import android.Manifest.permission.ACCESS_LOCATION_EXTRA_COMMANDS
 import android.Manifest.permission.ACCESS_NETWORK_STATE
 import android.Manifest.permission.ACCESS_WIFI_STATE
+import android.Manifest.permission.ACTIVITY_RECOGNITION
 import android.Manifest.permission.CHANGE_WIFI_STATE
 import android.Manifest.permission.FOREGROUND_SERVICE
 import android.Manifest.permission.INTERNET
@@ -38,6 +39,7 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SearchView
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.widget.ImageViewCompat
@@ -55,6 +57,7 @@ import androidx.navigation.ui.navigateUp
 import androidx.navigation.fragment.NavHostFragment
 import androidx.navigation.ui.setupActionBarWithNavController
 import androidx.navigation.ui.setupWithNavController
+import androidx.recyclerview.widget.RecyclerView
 import com.baidu.mapapi.map.BitmapDescriptorFactory
 import com.baidu.mapapi.map.InfoWindow
 import com.baidu.mapapi.map.MapStatusUpdateFactory
@@ -82,6 +85,7 @@ import moe.fuqiuluo.portalex.ext.gcj02
 import moe.fuqiuluo.portalex.ext.wgs84
 import moe.fuqiuluo.portalex.ui.FabBarAvoidanceHost
 import moe.fuqiuluo.portalex.ui.MapControlsHost
+import moe.fuqiuluo.portalex.ui.DrawerGroupDivider
 import moe.fuqiuluo.portalex.ui.home.HomeFragment
 import moe.fuqiuluo.portalex.ui.notification.NotificationUtils
 import moe.fuqiuluo.portalex.ui.viewmodel.BaiduMapViewModel
@@ -119,6 +123,32 @@ class MainActivity : AppCompatActivity() {
         return permissions
     }
 
+    /**
+     * 申请 **ACTIVITY_RECOGNITION**（活动识别 / 步数传感器）。
+     *
+     * 为什么单独一条而不是塞进 [getRequiredPermissions]：它是 **Android 10 (API 29) 才引入**的
+     * 运行时权限，而且本应用只把它用在 Test 页的"普通应用视角"步数探针
+     * （[moe.fuqiuluo.portalex.service.StepProbe]）上 —— **与定位/悬浮窗这条主功能链无关**。
+     * 塞进主清单会让"拒绝步数权限"也触发 `activity_no_permission` 整页拦截，
+     * 那是把可选功能升级成阻断条件（实测这套拦截会把整个界面换掉）。
+     *
+     * 于是走**非阻断**路径：同一套 `ActivityCompat` 申请、单独的请求码，
+     * 结果只在 `onRequestPermissionsResult` 里提示一句，不拦任何界面。
+     */
+    private fun requestActivityRecognitionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (ContextCompat.checkSelfPermission(this, ACTIVITY_RECOGNITION)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(ACTIVITY_RECOGNITION),
+            REQUEST_ACTIVITY_RECOGNITION_CODE
+        )
+    }
+
     private fun handleDeniedPermissions(denied: Set<String>) {
         denied.forEach { permission ->
             if (ActivityCompat.shouldShowRequestPermissionRationale(this, permission)) {
@@ -127,7 +157,6 @@ class MainActivity : AppCompatActivity() {
                 ActivityCompat.requestPermissions(this, arrayOf(permission), REQUEST_PERMISSIONS_CODE)
             }
         }
-
         if (denied.isEmpty()) {
             requireFloatWindows()
         }
@@ -192,6 +221,10 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.CREATED) {
+                // 活动识别（步数）权限：非阻断，独立请求码；与下面的主清单并行发起，
+                // 系统会按自己的规则排队弹窗（已被永久拒绝时它自己会静默跳过）。
+                requestActivityRecognitionIfNeeded()
+
                 if(checkPermission()) {
                     mockServiceViewModel.locationManager = getSystemService(LOCATION_SERVICE) as? LocationManager
                 }
@@ -209,12 +242,15 @@ class MainActivity : AppCompatActivity() {
                 appBarConfiguration = AppBarConfiguration(
                     setOf(
                         R.id.nav_home, R.id.nav_mock, R.id.nav_gnss_mock, R.id.nav_route_gallery,
+                        R.id.nav_stamina, R.id.nav_cadence, R.id.nav_angle_compass,
                         R.id.nav_calibration, R.id.nav_test, R.id.nav_settings
                     ), drawerLayout
                 )
 
                 setupActionBarWithNavController(navController, appBarConfiguration)
                 navView.setupWithNavController(navController)
+                // 工具页那组上方的细分隔线（单列表里用 ItemDecoration 画）
+                attachDrawerGroupDivider(navView, R.id.nav_calibration)
 
                 navController.addOnDestinationChangedListener(object: OnDestinationChangedListener {
                     override fun onDestinationChanged(
@@ -223,6 +259,15 @@ class MainActivity : AppCompatActivity() {
                         arguments: Bundle?
                     ) {
                         applyMenuVisibility(destination.id)
+
+                        // 关抽屉：NavigationUI 靠 `navigationView.parent is DrawerLayout` 来关，
+                        // 而这里 NavigationView 外层是容器 LinearLayout（为了把标题区固定在列表之外）
+                        // ⇒ 它关不掉。改为"目的地一变就关"，语义一样且与层级无关。
+                        drawerLayout.closeDrawers()
+
+                        // 两个 NavigationView 各管一半菜单：跳到另一半时要把这边的选中态清掉，
+                        // 否则两处会同时高亮（NavigationUI 只负责点亮匹配的那一项）
+
 
                         // 悬浮胶囊单实例：仅主界面/路线回放页/路线模拟页注册功能集
                         // （各自 Fragment onResume 中 setActions），其余目的地统一隐藏
@@ -288,6 +333,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 主界面才显示工具栏搜索/地图控件按钮（导航切换 + recreate 后均需应用） */
+    /**
+     * 在抽屉菜单的 [itemId] **上方**画一条细分隔线（把工具页与日常入口分开）。
+     *
+     * 定位方式：按**标题**匹配（presenter 的 adapter 里额外占了一个 header 槽位，
+     * 按下标推算错一位就会把线画到上一项上 —— 实测踩过）。
+     */
+    private fun attachDrawerGroupDivider(navView: NavigationView, itemId: Int) {
+        val title = navView.menu.findItem(itemId)?.title ?: return
+        val menuView = (0 until navView.childCount)
+            .map { navView.getChildAt(it) }
+            .firstOrNull { it is RecyclerView } as? RecyclerView ?: return
+        val color = MaterialColors.getColor(
+            navView, com.google.android.material.R.attr.colorOutlineVariant
+        )
+        val density = resources.displayMetrics.density
+        menuView.addItemDecoration(
+            DrawerGroupDivider(
+                targetTitle = title,
+                insetPx = (DRAWER_DIVIDER_INSET_DP * density).toInt(),
+                marginTopPx = (DRAWER_DIVIDER_MARGIN_TOP_DP * density).toInt(),
+                marginBottomPx = (DRAWER_DIVIDER_MARGIN_BOTTOM_DP * density).toInt(),
+                thicknessPx = density.coerceAtLeast(1f).toInt(),
+                color = color,
+            )
+        )
+    }
+
     private fun applyMenuVisibility(destinationId: Int) {
         val menu = binding.appBarMain.toolbar.menu
         menu.findItem(R.id.action_search)?.isVisible = destinationId == R.id.nav_home
@@ -323,6 +395,21 @@ class MainActivity : AppCompatActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_ACTIVITY_RECOGNITION_CODE) {
+            // 非阻断：只提示，不换界面（步数探针缺失只是"Test 页少一栏数据"，
+            // StepProbe 会自己把原因写进状态行；用户也可以在系统设置里补授权）。
+            val granted = permissions.isNotEmpty() &&
+                    grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val message = if (granted) {
+                "已授予活动识别权限：Test 页的步数探针可用"
+            } else {
+                "未授予活动识别权限：Test 页的「普通应用视角」步数探针会显示不可用"
+            }
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            android.util.Log.i("MainActivity", "ACTIVITY_RECOGNITION granted=$granted")
+            return
+        }
         if (requestCode == REQUEST_PERMISSIONS_CODE) {
             val denied = permissions.filterIndexed { index, _ ->
                 grantResults[index] != PackageManager.PERMISSION_GRANTED
@@ -631,8 +718,18 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQUEST_PERMISSIONS_CODE = 111
 
+        /** 活动识别（步数）权限用**独立请求码**：它的结果是非阻断的，不能和主清单混在一起判定 */
+        private const val REQUEST_ACTIVITY_RECOGNITION_CODE = 112
+
         /** 检索 SDK 强制要求 city 非 null；未拿到逆地理城市时用全国检索 */
         private const val DEFAULT_CITY = "全国"
+
+        /** 抽屉分组细分隔线的左右缩进（M3 抽屉分隔线的约定值 28dp） */
+        private const val DRAWER_DIVIDER_INSET_DP = 28
+
+        /** 分隔线的上下留白（真实间距：由 ItemDecoration 的 getItemOffsets 让出） */
+        private const val DRAWER_DIVIDER_MARGIN_TOP_DP = 8
+        private const val DRAWER_DIVIDER_MARGIN_BOTTOM_DP = 8
 
         internal var mCityString: String? = null
             set(value) {

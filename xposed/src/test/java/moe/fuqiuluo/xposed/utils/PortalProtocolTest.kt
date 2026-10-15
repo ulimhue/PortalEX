@@ -33,12 +33,22 @@ class PortalProtocolTest {
     @Test
     fun commandCount_isPinned() {
         // 新增/删除命令 ⇒ 改这条断言（顺带提醒你两侧都要接上）
-        assertEquals(30, cmd.size)
+        // 30 → 36：统一架构迁移（推进搬到系统侧）新增 set_rocker / set_route / route_control
+        //          / get_motion / get_stamina / reset_stamina
+        assertEquals(36, cmd.size)
     }
 
     @Test
     fun keyCount_isPinned() {
-        assertEquals(40, key.size)
+        // 新增/删除键 ⇒ 改这条断言
+        // 40 → 41：`stamina_config`（体力参数下发）
+        // 41 → 63：统一架构迁移 —— 推进/体力搬到系统侧后新增
+        //          report_duration、route_lat/lon/travelled/distance/points、
+        //          motion_mode/playing/completed，以及 stamina_* 状态回读 12 项
+        // 63 → 62：删掉 `hide_developer_mode`（"隐藏开发者模式"整条功能移除）
+        //          （断言当时没跟着改，实际仍是 63 —— 本轮顺手对齐）
+        // 63 → 67：按组波动两条参数 × 两组（波动强度 / 随机区间，默认 15%）
+        assertEquals(67, key.size)
     }
 
     @Test
@@ -77,7 +87,5 @@ class PortalProtocolTest {
         assertEquals("put_config", PortalProtocol.Cmd.PUT_CONFIG)
         assertEquals("set_sensor_mock", PortalProtocol.Cmd.SET_SENSOR_MOCK)
         assertEquals("get_sensor_status", PortalProtocol.Cmd.GET_SENSOR_STATUS)
-        assertEquals("binder_sensor_mock", PortalProtocol.Key.BINDER_SENSOR_MOCK)
-        assertEquals("binderSensorMock", PortalProtocol.Pref.BINDER_SENSOR_MOCK)
     }
 }
